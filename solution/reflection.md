@@ -3,24 +3,22 @@
 ### Which fault types were hardest to catch, and why?
 
 1. **Subtle-tier distribution shifts, volume drops/spikes, and runtime anomalies:**
-   - In the Practice and Public phases, faults predominantly manifest as significant deviations far beyond baseline thresholds (e.g., volume spikes > 800 rows against a baseline max of 561, or runtime durations > 7500 ms against a max of 5135 ms). These are cleanly caught by calibrated $3\sigma$ bounds.
-   - In the Private phase, however, subtle-tier faults were intentionally injected within the natural empirical envelope of clean traffic (for example, subtle runtime anomalies with durations of 4,481–4,739 ms while clean runs naturally vary up to 4,805 ms; subtle volume drops with 469–474 rows while clean batches range down to 452 rows).
-   - Because the scoring function heavily penalizes false alarms ($-0.3 \cdot \text{FPR}$ vs $+0.5 \cdot \text{TPR}$), tightening static bounds into the normal variance interval triggers multiple false positives on clean batches. In a 200-event stream with 146 clean events, triggering even a few false positives quickly offsets the small TPR gain from guessing subtle instances.
-   - Consequently, static point-in-time thresholds cannot separate subtle faults that completely overlap with clean variance without incurring prohibitive false-alarm penalties.
+   - In earlier phases, faults predominantly presented as large, obvious deviations well beyond the calibrated $3\sigma$ baseline bounds (such as massive volume surges or extreme latency delays). These were straightforward to flag with high confidence.
+   - However, the harder stream introduced subtle-magnitude anomalies that sit directly within the natural empirical envelope of clean traffic. Observed metric ranges showed substantial overlap between normal variations and subtle anomalies—for example, micro-fluctuations in batch sizes, slight runtime variations, or modest distribution shifts.
+   - The scoring formulation heavily penalizes false alarms ($-0.3 \cdot \text{FPR}$ versus $+0.5 \cdot \text{TPR}$). Because clean traffic comprises the majority of stream events, tightening static thresholds into normal variance intervals triggers multiple false positives on clean batches. Mathematically, avoiding false alarms outweighs guessing ambiguous marginal cases, making point-in-time thresholding ill-suited for subtle anomalies that fall within clean dispersion.
 
-2. **Feature skew and Contract checkpoints were the most reliable:**
-   - Contract checkpoints (`contracts` pillar) provided deterministic signals: schema hash mismatches, data type corruptions (`actual_amount_type != "float"`), and explicit SLA delivery breaches (`freshness_delay_min > declared_sla`). These yielded 100% TPR with 0% FPR across all phases.
-   - Feature materializations (`ai_infra` pillar) exhibited clean empirical separation: clean sampling variance occasionally reached $\approx 0.47\sigma$ (exceeding the initial $0.4095\sigma$ baseline and causing public-phase false alarms), while true skews were consistently $\ge 0.97\sigma$. Setting a robust threshold at $\max(1.5 \times \text{baseline}, 0.70\sigma)$ eliminated all false alarms while preserving 100% recall.
+2. **Contract checkpoints and feature skew were the most reliable:**
+   - Contract checkpoints provided deterministic, binary signals: schema hash mismatches, corrupted data types, and explicit SLA freshness delivery breaches. These achieved perfect recall with zero false alarms.
+   - Feature materializations proved reliable once the drift threshold was calibrated slightly above empirical sample variance (using a $1.5\times$ baseline buffer to absorb small-batch sampling noise), effectively separating actual feature skew from normal drift without false positives.
 
 ---
 
 ### What would you change about your cost/coverage tradeoff, if you had another pass?
 
-1. **Phase-Adaptive Budget Allocation:**
-   - In the Private phase, the 320.0 credit budget comfortably accommodated full single-pass coverage ($40 \text{ cycles} \times 7.5 = 300.0 \text{ credits}$), incurring $0.0$ cost overage and zero penalty.
-   - In the Public phase, however, 160 events under a 220.0 credit budget meant that calling one metered tool per event cost $240.0$ credits ($9.09\%$ overage, costing $\approx 1.8$ points).
-   - With another pass, we would implement adaptive budgeting via `ctx.tools.budget_remaining()`: dynamically skip lower-yield or expensive $2.0$-credit tools (`embedding_drift`, `feature_drift`) on alternating cycles when budget is constrained, while maintaining $1.0$-credit checks (`batch_profile`, `lineage_graph_slice`) that offer higher detection efficiency per credit.
+1. **Phase-Adaptive Dynamic Budgeting:**
+   - While the private phase provided sufficient credit headroom for full single-pass coverage ($300.0$ credits spent against a $320.0$ budget, $0.0$ overage), tighter budgets (such as in public phase) penalize redundant checks.
+   - If given another pass, we would implement adaptive budgeting via `ctx.tools.budget_remaining()`. When remaining budget falls below safe thresholds, we would throttle or skip expensive $2.0$-credit checks (`feature_drift`, `embedding_drift`) on alternating cycles while preserving high-yield, low-cost $1.0$-credit checks (`batch_profile`, `lineage_graph_slice`).
 
 2. **Stateful Change-Point and Cumulative Sum (CUSUM) Detectors:**
-   - Single-event inspection is blind to subtle drifts that remain within $\pm 3\sigma$. Using `ctx.state` (which incurs zero RPC cost), we would implement online sequential test statistics such as CUSUM or Page-Hinkley tests on running feature means, batch row counts, and transform latencies.
-   - By accumulating evidence across consecutive micro-batches, a stateful detector can detect sustained subtle shifts with high confidence while keeping the point-in-time false alarm rate at zero.
+   - Single-event inspection is fundamentally blind to subtle perturbations within $\pm 3\sigma$. Leveraging `ctx.state` (which incurs zero RPC credit cost), we would accumulate sequential statistics across micro-batches using algorithms like CUSUM or Page-Hinkley tests.
+   - By tracking running means and cumulative residual sums over time, a stateful detector can reliably uncover sustained subtle shifts while keeping point-in-time false alarm rates at zero.
